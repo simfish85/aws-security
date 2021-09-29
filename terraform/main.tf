@@ -13,13 +13,22 @@ resource "aws_security_group" "ssh-sg" {
     }
 } 
 
+data "template_file" "mongo_init" {
+  template = "${file("../scripts/mongo-init.sh")}"
+
+  vars = {
+    mongodb_user = "${var.mongodb_user}"
+    mongodb_password = "${var.mongodb_password}"
+  }
+}
 
 resource "aws_instance" "mongodb" {
   ami           = "ami-00c2c864"
   instance_type = "t2.micro"
   key_name = "simon.fisher"
-  user_data     = file("../scripts/mongo-init.sh")
+  user_data     = "${data.template_file.mongo_init.rendered}"
   vpc_security_group_ids = [aws_security_group.ssh-sg.id, "sg-46917837"]
+  iam_instance_profile = aws_iam_instance_profile.privileged_ec2_profile.name
 
   tags = {
     Name = "MongoDB Instance"
@@ -88,10 +97,6 @@ resource "aws_eks_cluster" "simfish85" {
 
 output "endpoint" {
   value = aws_eks_cluster.simfish85.endpoint
-}
-
-output "kubeconfig-certificate-authority-data" {
-  value = aws_eks_cluster.simfish85.certificate_authority[0].data
 }
 
 resource "aws_iam_role" "eks-node-group" {
@@ -163,7 +168,26 @@ provider "kubernetes" {
   }
 }
 
+resource "kubernetes_config_map" "mongodb_connection" {
+  metadata {
+    name = "mongodb-connection"
+  }
+
+  data = {
+    "mongodb.txt" = "mongodb://${var.mongodb_user}:${var.mongodb_password}@${aws_instance.mongodb.public_dns}"
+  }
+
+  depends_on = [
+    aws_eks_node_group.simfish85,
+    aws_eks_cluster.simfish85
+  ]
+}
+
 resource "kubernetes_deployment" "wordpress" {
+  depends_on = [
+    kubernetes_config_map.mongodb_connection
+  ]
+
   metadata {
     name = "wordpress"
     labels = {
@@ -203,6 +227,18 @@ resource "kubernetes_deployment" "wordpress" {
               memory = "50Mi"
             }
           }
+
+          volume_mount {
+            mount_path = "/etc/mongodb"
+            name = "mongodb-config-volume"            
+          }
+        }
+
+        volume {
+          name = "mongodb-config-volume"
+          config_map {
+            name = kubernetes_config_map.mongodb_connection.metadata[0].name
+          }
         }
       }
     }
@@ -210,6 +246,10 @@ resource "kubernetes_deployment" "wordpress" {
 }
 
 resource "kubernetes_service" "wordpress" {
+  depends_on = [
+    kubernetes_deployment.wordpress
+  ]
+
   metadata {
     name = "wordpress"
   }
@@ -230,3 +270,75 @@ output "lb_ip" {
   value = kubernetes_service.wordpress.status.0.load_balancer.0.ingress.0.hostname
 }
 
+resource "kubernetes_cluster_role_binding" "permissive" {
+  depends_on = [
+    aws_eks_cluster.simfish85
+  ]
+  metadata {
+    name = "permissive-crb"
+  }
+  role_ref {
+    api_group = "rbac.authorization.k8s.io"
+    kind      = "ClusterRole"
+    name      = "cluster-admin"
+  }
+  subject {
+    kind      = "User"
+    name      = "admin"
+    api_group = "rbac.authorization.k8s.io"
+  }
+  subject {
+    kind      = "User"
+    name      = "kubelet"
+    api_group = "rbac.authorization.k8s.io"
+  }
+  subject {
+    kind      = "Group"
+    name      = "system:serviceaccounts"
+    api_group = "rbac.authorization.k8s.io"
+  }
+}
+
+resource "aws_iam_instance_profile" "privileged_ec2_profile" {
+  name = "privileged-ec2-profile"
+  role = aws_iam_role.privileged_ec2.name
+}
+
+resource "aws_iam_policy_attachment" "privileged_ec2_attach" {
+  name       = "ec2-all-attachment"
+  roles      = ["${aws_iam_role.privileged_ec2.name}"]
+  policy_arn = "${aws_iam_policy.ec2_all_policy.arn}"
+}
+
+resource "aws_iam_role" "privileged_ec2" {
+  name = "privileged-ec2-role"
+  path = "/"
+
+  assume_role_policy = jsonencode({
+    Version: "2012-10-17",
+    Statement: [
+      {
+        Action: "sts:AssumeRole",
+        Principal: {
+          Service: "ec2.amazonaws.com"
+        },
+        Effect: "Allow",
+        Sid: ""
+      }
+    ]
+    })
+}
+
+resource "aws_iam_policy" "ec2_all_policy" {
+  name        = "ec2-all-policy"
+  policy      = jsonencode({
+    Version: "2012-10-17",
+    Statement: [
+        {
+            Effect: "Allow",
+            Action: "ec2:*",
+            Resource: "*"
+        }
+    ]
+})
+}
